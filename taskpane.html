@@ -1,0 +1,258 @@
+https://github.com/rwinNMU/Excel-Ref-Range-<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=Edge" />
+    <title>Reference Value Advisor</title>
+    <!-- Office.js: The core library for interacting with Excel -->
+    <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js" type="text/javascript"></script>
+    <!-- Tailwind CSS for styling -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { font-family: 'Segoe UI', sans-serif; padding: 10px; }
+        .result-box { border: 1px solid #ccc; padding: 10px; margin-top: 10px; border-radius: 4px; }
+        /* Simple spinner for loading state */
+        .loader {
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid #3498db;
+            border-radius: 50%;
+            width: 20px;
+            height: 20px;
+            animation: spin 1s linear infinite;
+            display: inline-block;
+            vertical-align: middle;
+            margin-right: 5px;
+        }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+    </style>
+</head>
+<body class="bg-gray-100">
+    <div id="content-main" class="p-2">
+        <h1 class="text-xl font-bold mb-4 text-blue-700">Ref Value Advisor</h1>
+        
+        <p class="mb-2 text-sm">Select a column of data (with header).</p>
+        
+        <!-- Method Selection -->
+        <div class="mb-4">
+            <label class="block text-sm font-bold mb-1">Method:</label>
+            <select id="method-select" class="w-full p-2 border rounded bg-white">
+                <option value="parametric">Parametric (Normal Distribution)</option>
+                <option value="robust">Robust (Non-Parametric + Bootstrap)</option>
+            </select>
+        </div>
+
+        <div class="flex gap-2 mb-4">
+            <button id="run-btn" class="bg-blue-600 text-white px-4 py-2 rounded hover:bg-blue-700 w-full flex justify-center items-center">
+                <span id="btn-text">Calculate</span>
+            </button>
+        </div>
+
+        <!-- Results Area -->
+        <div id="results" class="hidden result-box bg-white shadow">
+            <h3 class="font-bold text-sm mb-2 text-gray-700 border-b pb-1">Statistics</h3>
+            <div class="grid grid-cols-2 gap-2 text-sm">
+                <div><span class="text-gray-500">N:</span> <span id="val-n" class="font-medium">0</span></div>
+                <div><span class="text-gray-500">Method:</span> <span id="val-method" class="font-medium">-</span></div>
+                <div><span class="text-gray-500">Mean/Med:</span> <span id="val-central" class="font-medium">0</span></div>
+                <div><span class="text-gray-500">SD/MAD:</span> <span id="val-dispersion" class="font-medium">0</span></div>
+            </div>
+
+            <h3 class="font-bold text-sm mt-4 mb-2 text-gray-700 border-b pb-1">Reference Interval (95%)</h3>
+            
+            <div class="mb-2">
+                <p class="text-xs text-gray-500 uppercase">Lower Limit (2.5%)</p>
+                <p class="text-lg text-blue-800 font-bold" id="val-lower">0</p>
+                <p class="text-xs text-gray-400 hidden" id="ci-lower">90% CI: [--, --]</p>
+            </div>
+
+            <div>
+                <p class="text-xs text-gray-500 uppercase">Upper Limit (97.5%)</p>
+                <p class="text-lg text-blue-800 font-bold" id="val-upper">0</p>
+                <p class="text-xs text-gray-400 hidden" id="ci-upper">90% CI: [--, --]</p>
+            </div>
+        </div>
+        
+        <div id="error-msg" class="text-red-500 text-sm mt-2 hidden"></div>
+    </div>
+
+    <script>
+        Office.onReady((info) => {
+            if (info.host === Office.HostType.Excel) {
+                document.getElementById("run-btn").onclick = run;
+            }
+        });
+
+        async function run() {
+            setLoading(true);
+            try {
+                await Excel.run(async (context) => {
+                    // 1. Get Data
+                    const range = context.workbook.getSelectedRange();
+                    range.load("values");
+                    await context.sync();
+
+                    // 2. Process Data
+                    const rawData = range.values;
+                    // Flatten and filter numeric values
+                    let numericData = rawData.flat().filter(val => typeof val === 'number' && !isNaN(val));
+
+                    if (numericData.length < 20) { // Standard advice is N>40, but soft limit 20 for logic
+                        throw new Error("Sample size too small (N < 20). Please select more data.");
+                    }
+
+                    // 3. Select Logic based on Dropdown
+                    const method = document.getElementById("method-select").value;
+                    let result;
+
+                    if (method === "parametric") {
+                        result = calculateParametric(numericData);
+                    } else {
+                        // Use setTimeout to allow UI to render loader before heavy calculation
+                        result = await new Promise(resolve => {
+                            setTimeout(() => resolve(calculateRobustBootstrap(numericData)), 50);
+                        });
+                    }
+
+                    // 4. Update UI
+                    displayResults(result);
+                });
+            } catch (error) {
+                showError(error.message);
+            } finally {
+                setLoading(false);
+            }
+        }
+
+        // --- CALCULATION METHODS ---
+
+        function calculateParametric(data) {
+            const n = data.length;
+            const mean = data.reduce((a, b) => a + b, 0) / n;
+            const variance = data.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / (n - 1);
+            const sd = Math.sqrt(variance);
+
+            return {
+                n: n,
+                method: "Parametric",
+                central: mean,
+                dispersion: sd,
+                lower: mean - (1.96 * sd),
+                upper: mean + (1.96 * sd),
+                hasCI: false // Parametric CI requires different logic, omitted for brevity
+            };
+        }
+
+        function calculateRobustBootstrap(data) {
+            const n = data.length;
+            // Sort original data
+            data.sort((a, b) => a - b);
+
+            // 1. Point Estimates (Quantiles of original data)
+            const median = quantile(data, 0.5);
+            // Robust dispersion (MAD) just for info
+            const mad = data.map(x => Math.abs(x - median)).sort((a,b)=>a-b)[Math.floor(n/2)]; 
+            
+            const lowerLimit = quantile(data, 0.025);
+            const upperLimit = quantile(data, 0.975);
+
+            // 2. Bootstrap for Confidence Intervals (90% CI of the limits)
+            // This replaces the complex VBA resampling macros
+            const iterations = 1000;
+            const lowerBoots = [];
+            const upperBoots = [];
+
+            for (let i = 0; i < iterations; i++) {
+                // Resample with replacement
+                const sample = [];
+                for (let j = 0; j < n; j++) {
+                    sample.push(data[Math.floor(Math.random() * n)]);
+                }
+                sample.sort((a, b) => a - b);
+                
+                lowerBoots.push(quantile(sample, 0.025));
+                upperBoots.push(quantile(sample, 0.975));
+            }
+
+            lowerBoots.sort((a, b) => a - b);
+            upperBoots.sort((a, b) => a - b);
+
+            // 90% CI indices (5th and 95th percentiles of the bootstrap distribution)
+            const idx5 = Math.floor(iterations * 0.05);
+            const idx95 = Math.floor(iterations * 0.95);
+
+            return {
+                n: n,
+                method: "Robust (Bootstrap)",
+                central: median,
+                dispersion: mad, // Displaying MAD as dispersion metric
+                lower: lowerLimit,
+                upper: upperLimit,
+                hasCI: true,
+                lowerCI: [lowerBoots[idx5], lowerBoots[idx95]],
+                upperCI: [upperBoots[idx5], upperBoots[idx95]]
+            };
+        }
+
+        // Helper: Calculate Percentile (Quantile)
+        function quantile(sortedData, q) {
+            const pos = (sortedData.length - 1) * q;
+            const base = Math.floor(pos);
+            const rest = pos - base;
+            if ((sortedData[base + 1] !== undefined)) {
+                return sortedData[base] + rest * (sortedData[base + 1] - sortedData[base]);
+            } else {
+                return sortedData[base];
+            }
+        }
+
+        // --- UI HELPERS ---
+
+        function displayResults(res) {
+            document.getElementById("val-n").innerText = res.n;
+            document.getElementById("val-method").innerText = res.method.includes("Robust") ? "Robust" : "Parametric";
+            document.getElementById("val-central").innerText = res.central.toFixed(3);
+            document.getElementById("val-dispersion").innerText = res.dispersion.toFixed(3);
+            
+            document.getElementById("val-lower").innerText = res.lower.toFixed(3);
+            document.getElementById("val-upper").innerText = res.upper.toFixed(3);
+
+            const ciLowerEl = document.getElementById("ci-lower");
+            const ciUpperEl = document.getElementById("ci-upper");
+
+            if (res.hasCI) {
+                ciLowerEl.innerText = `90% CI: [${res.lowerCI[0].toFixed(2)}, ${res.lowerCI[1].toFixed(2)}]`;
+                ciUpperEl.innerText = `90% CI: [${res.upperCI[0].toFixed(2)}, ${res.upperCI[1].toFixed(2)}]`;
+                ciLowerEl.classList.remove("hidden");
+                ciUpperEl.classList.remove("hidden");
+            } else {
+                ciLowerEl.classList.add("hidden");
+                ciUpperEl.classList.add("hidden");
+            }
+
+            document.getElementById("results").classList.remove("hidden");
+            document.getElementById("error-msg").classList.add("hidden");
+        }
+
+        function setLoading(isLoading) {
+            const btn = document.getElementById("run-btn");
+            const btnText = document.getElementById("btn-text");
+            if (isLoading) {
+                btn.disabled = true;
+                btn.classList.add("opacity-50", "cursor-not-allowed");
+                btnText.innerHTML = '<div class="loader"></div> Processing...';
+            } else {
+                btn.disabled = false;
+                btn.classList.remove("opacity-50", "cursor-not-allowed");
+                btnText.innerText = "Calculate";
+            }
+        }
+
+        function showError(msg) {
+            const el = document.getElementById("error-msg");
+            el.innerText = msg;
+            el.classList.remove("hidden");
+            document.getElementById("results").classList.add("hidden");
+        }
+    </script>
+</body>
+</html>Calculator
